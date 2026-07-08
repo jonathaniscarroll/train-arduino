@@ -5,11 +5,14 @@ A physical-to-digital model railway installation. A potentiometer on a real mode
 ## System Architecture
 
 ```
-Physical throttle pot
+Physical throttle pot (~19V controller, 10kΩ pot)
         │
         ▼
-  ESP32 ADC (GPIO34)
-  EMA filter applied
+  Voltage divider (R1=47kΩ, R2=10kΩ) → scales ~19V down to ~3.3V
+        │
+        ▼
+  ESP32 ADC GPIO34 (ADC1 — safe with Wi-Fi active)
+  16-sample averaging + EMA filter (α=0.03) applied
         │  WebSocket  ws://<esp32-ip>/ws
         ▼
   Unity NativeWebSocket client
@@ -32,23 +35,46 @@ A debug web page is also served by the ESP32 at its local IP — visit it in any
 ```
 train-arduino/
 ├── esp32/
+│   ├── WIRING.md                       # Full wiring diagram, divider math, debug checklist
 │   └── train_pot_ws/
-│       └── train_pot_ws.ino        # ESP32 firmware: reads pot, EMA filter, WebSocket server
+│       └── train_pot_ws.ino            # ESP32 firmware: reads pot, averaging + EMA filter, WebSocket server
 ├── unity/
-│   └── TrainSpeedReceiver.cs       # Unity script: WebSocket client → ILocomotive API
+│   └── TrainSpeedReceiver.cs           # Unity script: WebSocket client → ILocomotive API
 ├── Train Controller (Railroad System) User Manual v3.4.pdf
 └── README.md
 ```
 
 ## Wiring
 
-| Pot leg | Connect to |
-|---------|-----------|
-| Outer leg 1 | **3.3V** on ESP32 |
-| Outer leg 2 | **GND** on ESP32 |
-| Middle (wiper) | **GPIO34** on ESP32 |
+> ⚠️ The controller runs at **~19V** — the pot wiper **must not** connect directly to the ESP32. A voltage divider is required. See [`esp32/WIRING.md`](esp32/WIRING.md) for the full diagram.
 
-> ⚠️ Use **3.3V only** — the ESP32 ADC is not 5V tolerant.
+### Pot Identification
+
+The throttle pot has no markings. It measures ~10kΩ outer-to-outer on a multimeter (reads `010` on the 2000k range). The controller's reference voltage is ~19V.
+
+### Voltage Divider (wiper → ESP32)
+
+```
+Controller ref (~19V) ──── Pot outer pin A
+Controller GND        ──── Pot outer pin B
+
+Pot wiper ────────────────────── Controller speed input node
+          │
+          ├── R1 (47kΩ) ──┬── ESP32 GPIO34 (ADC1)
+                          │
+                        R2 (10kΩ)
+                          │
+Controller GND ────────────┴── ESP32 GND
+```
+
+**Divider math:** `19V × (10k ÷ (47k + 10k)) ≈ 3.33V` at full throttle — just within the ESP32's 3.3V ADC limit.
+
+### Hardware notes
+
+- **Shared ground is mandatory** — ESP32 GND and controller GND must be the same node
+- **Add a 0.1µF ceramic cap** from GPIO34 to GND (close to the ESP32 pin) to reduce noise
+- **Use ADC1 pins only** (GPIO32–39) while Wi-Fi is active — ADC2 is disabled by Wi-Fi
+- **Measure the divider output** with a multimeter before connecting the ESP32, confirm it stays under 3.3V at max throttle
 
 ## ESP32 Setup
 
@@ -57,13 +83,14 @@ train-arduino/
 3. Install required Arduino libraries:
    - [`ESPAsyncWebServer`](https://github.com/ESP32Async/ESPAsyncWebServer)
    - `AsyncTCP`
-4. Upload to the ESP32
-5. Open Serial Monitor at **115200 baud** — the local IP will be printed on connect
-6. Visit that IP in a browser to confirm live pot readings
+4. Wire up the voltage divider as shown above
+5. Upload to the ESP32
+6. Open Serial Monitor at **115200 baud** — the local IP will be printed on connect
+7. Visit that IP in a browser to confirm live pot readings
 
 ### Message Format
 
-The ESP32 broadcasts a WebSocket message on every ADC read:
+The ESP32 broadcasts a WebSocket message whenever the value changes meaningfully:
 
 ```
 raw,filtered
@@ -71,8 +98,19 @@ raw,filtered
 
 For example: `2051,2048`
 
-- **raw** — direct 12-bit ADC reading (0–4095)
-- **filtered** — EMA-smoothed value (reduces jitter); this is what `TrainSpeedReceiver.cs` uses
+- **raw** — 16-sample averaged 12-bit ADC reading (0–4095)
+- **filtered** — EMA-smoothed value (α=0.03); this is what `TrainSpeedReceiver.cs` uses
+
+### Noise Reduction
+
+ESP32 ADC is inherently noisy, especially when Wi-Fi is active. Four layers of mitigation are used:
+
+| Layer | What it does |
+|---|---|
+| 0.1µF cap on GPIO34 | Filters high-frequency hardware noise |
+| 16-sample averaging | Discards first read, averages 16 reads with 200µs gaps |
+| EMA filter α=0.03 | Slow exponential moving average smooths remaining jitter |
+| Deadband (±12 counts / 50ms) | Suppresses micro-fluctuations from triggering WebSocket sends |
 
 ## Unity Setup
 
@@ -125,6 +163,8 @@ The asset's own acceleration physics, wagon coupling, SFX, Control Zones, and si
 | Unity train moves opposite to physical | Enable **Invert Speed** |
 | No connection | Confirm IP in Serial Monitor; check WiFi; verify ESP32 upload succeeded |
 | `ILocomotive` not found | Ensure locomotive GameObject has `TrainController_v3` or `SplineBasedLocomotive` component |
+| ESP32 reads zero or nothing | Check shared ground; confirm divider junction is under 3.3V; use GPIO32–39 only |
+| Readings still fluctuate wildly | Add 0.1µF cap on GPIO34 to GND; confirm `analogReadResolution` / `analogSetAttenuation` are in `setup()` only |
 
 ## Dependencies
 
