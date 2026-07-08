@@ -13,6 +13,15 @@
  *  - Add a 0.1µF ceramic cap from GPIO34 to GND (close to the pin)
  *    to reduce high-frequency ADC noise
  *  - Use ADC1 pins only (GPIO32-39) while Wi-Fi is active
+ *
+ * WEBSOCKET STABILITY NOTES:
+ *  - A ping frame is sent every PING_INTERVAL_MS to prevent Unity
+ *    NativeWebSocket from closing the connection with "abnormal closure".
+ *    Without keepalive pings the client-side TCP idle timeout fires.
+ *  - readPotAveraged() uses millis()-based timing instead of
+ *    delayMicroseconds() so the async TCP stack is never blocked.
+ *  - cleanupClients() is rate-limited to avoid kicking clients that
+ *    are still completing their opening handshake.
  */
 
 #include <WiFi.h>
@@ -25,25 +34,40 @@ const char* password = "";
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-const int potPin = 34;     // ADC1 — safe with Wi-Fi active
-int lastSent = -1;
-unsigned long lastSendTime = 0;
-float filtered = 0.0f;
-const float alpha = 0.03f; // Slower smoothing — reduces Wi-Fi ADC noise
+const int potPin = 34;            // ADC1 — safe with Wi-Fi active
 
-// Read 16 samples with a short delay between each, discard first read.
-// Oversampling + averaging is the primary fix for noisy ESP32 ADC.
+// ── Timing constants ────────────────────────────────────────────────────────
+const unsigned long PING_INTERVAL_MS    = 5000;  // send WS ping every 5 s
+const unsigned long CLEANUP_INTERVAL_MS = 2000;  // cleanupClients every 2 s
+const unsigned long SEND_INTERVAL_MS    =   50;  // max send rate
+const unsigned long SAMPLE_INTERVAL_US  =  200;  // gap between ADC samples
+
+// ── State ────────────────────────────────────────────────────────────────────
+int lastSent = -1;
+unsigned long lastSendTime    = 0;
+unsigned long lastPingTime    = 0;
+unsigned long lastCleanupTime = 0;
+float filtered = 0.0f;
+const float alpha = 0.03f;
+
+// ── ADC sampling ─────────────────────────────────────────────────────────────
+// Uses millis/micros-based non-blocking loop rather than delayMicroseconds()
+// so the async TCP stack is never starved.
 int readPotAveraged() {
-  analogRead(potPin);        // dummy read — discard
-  delayMicroseconds(200);
+  // Dummy read to discharge sample-and-hold capacitor
+  analogRead(potPin);
+
   long total = 0;
-  for (int i = 0; i < 16; i++) {
+  const int SAMPLES = 16;
+  for (int i = 0; i < SAMPLES; i++) {
+    unsigned long t = micros();
+    while (micros() - t < SAMPLE_INTERVAL_US) {}  // busy-wait only 200 µs
     total += analogRead(potPin);
-    delayMicroseconds(200);
   }
-  return (int)(total / 16);
+  return (int)(total / SAMPLES);
 }
 
+// ── HTML debug page ──────────────────────────────────────────────────────────
 const char index_html[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html>
@@ -56,6 +80,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     .value { font-size: 2rem; font-weight: bold; color: #4af; }
     .label { margin-top: 12px; opacity: 0.8; }
     #bar { height: 20px; background: #4af; width: 0%; transition: width 0.1s; border-radius: 4px; margin-top: 12px; }
+    #status { margin-top: 8px; font-size: 0.85rem; opacity: 0.6; }
   </style>
 </head>
 <body>
@@ -65,52 +90,84 @@ const char index_html[] PROGMEM = R"rawliteral(
   <div style="background:#333; border-radius:4px; overflow:hidden; margin-top: 12px;">
     <div id="bar"></div>
   </div>
+  <div id="status">Connecting...</div>
   <script>
-    const rawEl = document.getElementById('raw');
+    const rawEl      = document.getElementById('raw');
     const filteredEl = document.getElementById('filtered');
-    const bar = document.getElementById('bar');
-    const ws  = new WebSocket(`ws://${location.host}/ws`);
-    ws.onmessage = e => {
-      const [raw, filtered] = e.data.split(',');
-      rawEl.textContent = raw;
-      filteredEl.textContent = filtered;
-      bar.style.width = (parseInt(filtered) / 4095 * 100).toFixed(1) + '%';
-    };
+    const bar        = document.getElementById('bar');
+    const statusEl   = document.getElementById('status');
+    function connect() {
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      ws.onopen    = ()  => { statusEl.textContent = 'Connected'; };
+      ws.onclose   = ()  => { statusEl.textContent = 'Disconnected — reconnecting...'; setTimeout(connect, 2000); };
+      ws.onerror   = ()  => { statusEl.textContent = 'Error'; };
+      ws.onmessage = e  => {
+        // ignore server ping frames (empty or "ping")
+        if (!e.data || e.data === 'ping') return;
+        const [raw, filtered] = e.data.split(',');
+        rawEl.textContent      = raw;
+        filteredEl.textContent = filtered;
+        bar.style.width        = (parseInt(filtered) / 4095 * 100).toFixed(1) + '%';
+      };
+    }
+    connect();
   </script>
 </body>
 </html>
 )rawliteral";
 
+// ── WebSocket event handler ───────────────────────────────────────────────────
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("[WS] Client #%u connected from %s\n",
+                  client->id(), client->remoteIP().toString().c_str());
+    // Send current reading immediately on connect
+    int raw = readPotAveraged();
+    filtered = (float)raw;
+    client->text(String(raw) + "," + String(raw));
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("[WS] Client #%u disconnected\n", client->id());
+  } else if (type == WS_EVT_ERROR) {
+    Serial.printf("[WS] Client #%u error\n", client->id());
+  }
+}
+
+// ── Notify clients with pot value ─────────────────────────────────────────────
 void notifyClients() {
+  if (ws.count() == 0) return;  // no clients — skip ADC read entirely
+
   int raw = readPotAveraged();
   filtered = filtered + alpha * (raw - filtered);
   int filt = (int)(filtered + 0.5f);
 
-  // Deadband: only send if change is meaningful or enough time has passed
-  if (abs(filt - lastSent) < 12 && millis() - lastSendTime < 50) return;
+  // Deadband: skip send if change is tiny AND we sent recently
+  if (abs(filt - lastSent) < 12 && millis() - lastSendTime < SEND_INTERVAL_MS) return;
 
-  lastSent = filt;
+  lastSent     = filt;
   lastSendTime = millis();
   ws.textAll(String(raw) + "," + String(filt));
-  Serial.println(String("raw:") + raw + " filt:" + filt);
 }
 
-void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
-               AwsEventType type, void *arg, uint8_t *data, size_t len) {
-  if (type == WS_EVT_CONNECT) {
-    int raw = readPotAveraged();
-    filtered = raw;
-    client->text(String(raw) + "," + String(raw));
-  }
+// ── Keepalive ping ────────────────────────────────────────────────────────────
+// Prevents Unity NativeWebSocket from dropping the connection with
+// "WebSocket closed: abnormal" due to TCP idle timeout.
+void sendPing() {
+  if (ws.count() == 0) return;
+  unsigned long now = millis();
+  if (now - lastPingTime < PING_INTERVAL_MS) return;
+  lastPingTime = now;
+  ws.pingAll();  // sends a WebSocket ping frame to all connected clients
 }
 
+// ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   pinMode(potPin, INPUT);
 
   // Configure ADC once in setup — not in the read loop
-  analogReadResolution(12);        // 0-4095
-  analogSetAttenuation(ADC_11db);  // 0-3.3V input range
+  analogReadResolution(12);        // 0–4095
+  analogSetAttenuation(ADC_11db);  // 0–3.3V input range
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -131,11 +188,21 @@ void setup() {
   });
 
   server.begin();
-  Serial.println("WebSocket server started at /ws");
+  Serial.println("WebSocket server started — visit http://" + WiFi.localIP().toString());
 }
 
+// ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
   notifyClients();
-  ws.cleanupClients();
+  sendPing();
+
+  // Rate-limit cleanupClients — calling it every loop iteration can
+  // kick clients that are still completing the opening handshake.
+  unsigned long now = millis();
+  if (now - lastCleanupTime >= CLEANUP_INTERVAL_MS) {
+    lastCleanupTime = now;
+    ws.cleanupClients();
+  }
+
   delay(10);
 }
