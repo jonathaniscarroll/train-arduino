@@ -1,6 +1,7 @@
 using System.Globalization;
 using NativeWebSocket;
 using UnityEngine;
+using WSMGameStudio.RailroadSystem;
 
 // Requires: WSM Game Studio - Train Controller (Railroad System) v3.4
 // Both TrainController_v3 (physics) and SplineBasedLocomotive (spline) expose ILocomotive.
@@ -83,6 +84,20 @@ public class TrainSpeedReceiver : MonoBehaviour
         _ws.OnOpen    += ()  => Debug.Log("[TrainSpeed] WebSocket connected");
         _ws.OnError   += (e) => Debug.LogError($"[TrainSpeed] WebSocket error: {e}");
         _ws.OnClose   += (e) => Debug.Log($"[TrainSpeed] WebSocket closed: {e}");
+        _ws.OnClose += (e) => restart();
+        _ws.OnMessage += OnMessage;
+
+        await _ws.Connect();
+    }
+
+    async void restart()
+    {
+        if (_ws != null) await _ws.Close();
+        _ws = new WebSocket($"ws://{esp32Ip}/ws");
+        _ws.OnOpen += () => Debug.Log("[TrainSpeed] WebSocket connected");
+        _ws.OnError += (e) => Debug.LogError($"[TrainSpeed] WebSocket error: {e}");
+        _ws.OnClose += (e) => Debug.Log($"[TrainSpeed] WebSocket closed: {e}");
+        _ws.OnClose += (e) => restart();
         _ws.OnMessage += OnMessage;
 
         await _ws.Connect();
