@@ -1,5 +1,17 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 4   // change to however many 8x8 modules you have
+
+#define MATRIX_DATA_PIN D10
+#define MATRIX_CLK_PIN  D8
+#define MATRIX_CS_PIN   D9
+
+MD_Parola matrix = MD_Parola(HARDWARE_TYPE, MATRIX_DATA_PIN, MATRIX_CLK_PIN, MATRIX_CS_PIN, MAX_DEVICES);
 
 // ===========================
 // Select camera model in board_config.h
@@ -19,6 +31,11 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
+
+    matrix.begin();
+  matrix.setIntensity(2);
+  matrix.displayClear();
+  matrix.displayText("TRAIN CAM", PA_CENTER, 75, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -125,6 +142,8 @@ void setup() {
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  if (matrix.displayAnimate()) {
+    matrix.displayReset();
+  }
+  delay(5);
 }
