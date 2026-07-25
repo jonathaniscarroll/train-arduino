@@ -1,42 +1,211 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
 #include <SPI.h>
+#include <ArduinoWebsockets.h>
 
-#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
-#define MAX_DEVICES 4   // change to however many 8x8 modules you have
-
-#define MATRIX_DATA_PIN D10
-#define MATRIX_CLK_PIN  D8
-#define MATRIX_CS_PIN   D9
-
-MD_Parola matrix = MD_Parola(HARDWARE_TYPE, MATRIX_DATA_PIN, MATRIX_CLK_PIN, MATRIX_CS_PIN, MAX_DEVICES);
+using namespace websockets;
 
 // ===========================
-// Select camera model in board_config.h
-// ===========================
-#include "board_config.h"
-
-// ===========================
-// Enter your WiFi credentials
+// Tunable settings
 // ===========================
 const char *ssid = "Wireless-N";
 const char *password = "";
 
+const char *controllerHost = "192.168.1.50";
+const uint16_t controllerPort = 80;
+const char *controllerPath = "/ws";
+
+#define HOSTNAME "traincam"
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 4
+#define MATRIX_DATA_PIN D10
+#define MATRIX_CLK_PIN  D8
+#define MATRIX_CS_PIN   D9
+
+const char *SCROLL_TEXT = "EVERY POSSIBLE WORLD IS AS REAL AS OUR ACTUAL WORLD    ";
+const uint8_t MATRIX_INTENSITY = 2;
+
+// Map controller filtered ADC to Parola scroll speed.
+// Lower Parola speed number = faster movement.
+const int ADC_MIN_ACTIVE = 900;
+const int ADC_MAX_ACTIVE = 3200;
+const int PAROLA_SPEED_SLOW = 120;
+const int PAROLA_SPEED_FAST = 12;
+const int STOP_THRESHOLD = 850;
+const bool HOLD_TEXT_WHEN_STOPPED = false;
+
+const uint32_t WS_RECONNECT_MS = 3000;
+const uint32_t STATUS_LOG_MS = 2000;
+
+// ===========================
+// Camera board config
+// ===========================
+#include "board_config.h"
+
+MD_Parola matrix = MD_Parola(HARDWARE_TYPE, MATRIX_DATA_PIN, MATRIX_CLK_PIN, MATRIX_CS_PIN, MAX_DEVICES);
+WebServer server(80);
+WebsocketsClient wsClient;
+
+bool wsConnected = false;
+unsigned long lastWsAttempt = 0;
+unsigned long lastStatusLog = 0;
+int latestRaw = 0;
+int latestFiltered = 0;
+int currentMatrixSpeed = PAROLA_SPEED_SLOW;
+bool matrixStopped = false;
+
 void startCameraServer();
 void setupLedFlash();
 
-void setup() {
-  Serial.begin(115200);
-  Serial.setDebugOutput(true);
-  Serial.println();
+String htmlPage() {
+  String html;
+  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>XIAO Train Camera</title>";
+  html += "<style>body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:20px}"
+          ".card{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:16px;max-width:920px}"
+          "img{width:100%;max-width:800px;height:auto;border-radius:12px;border:1px solid #333}"
+          "code{background:#222;padding:2px 6px;border-radius:6px} .ok{color:#7ee787}.warn{color:#ffd866}</style></head><body>";
+  html += "<div class='card'><h1>XIAO Train Camera</h1>";
+  html += "<p>Camera stream: <code>/stream</code> &nbsp; Snapshot: <code>/snapshot</code> &nbsp; Status: <code>/status</code></p>";
+  html += "<p>Controller WS: ";
+  html += wsConnected ? "<span class='ok'>connected</span>" : "<span class='warn'>disconnected</span>";
+  html += " &nbsp; Raw: " + String(latestRaw) + " &nbsp; Filtered: " + String(latestFiltered) + " &nbsp; Matrix speed: " + String(currentMatrixSpeed) + "</p>";
+  html += "<img src='/stream' alt='Train camera stream'>";
+  html += "</div></body></html>";
+  return html;
+}
 
-    matrix.begin();
-  matrix.setIntensity(2);
+void handleRoot() {
+  server.send(200, "text/html", htmlPage());
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"wsConnected\":" + String(wsConnected ? "true" : "false");
+  json += ",\"raw\":" + String(latestRaw);
+  json += ",\"filtered\":" + String(latestFiltered);
+  json += ",\"matrixSpeed\":" + String(currentMatrixSpeed);
+  json += ",\"matrixStopped\":" + String(matrixStopped ? "true" : "false");
+  json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSnapshot() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(503, "text/plain", "Camera frame unavailable");
+    return;
+  }
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Length", String(fb->len));
+  server.send(200);
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+  client.print("HTTP/1.1 200 OK\r\n");
+  client.print("Content-Type: multipart/x-mixed-replace; boundary=frame\r\n");
+  client.print("Cache-Control: no-cache\r\n\r\n");
+
+  while (client.connected()) {
+    wsClient.poll();
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      delay(30);
+      continue;
+    }
+
+    client.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
+    client.print(fb->len);
+    client.print("\r\n\r\n");
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
+    esp_camera_fb_return(fb);
+
+    if (matrixStopped) {
+      delay(60);
+    } else {
+      delay(30);
+    }
+  }
+}
+
+void updateMatrixSpeedFromFiltered(int filtered) {
+  latestFiltered = filtered;
+
+  if (filtered <= STOP_THRESHOLD) {
+    matrixStopped = true;
+    currentMatrixSpeed = PAROLA_SPEED_SLOW;
+    matrix.setSpeed(currentMatrixSpeed);
+    return;
+  }
+
+  matrixStopped = false;
+  int clamped = constrain(filtered, ADC_MIN_ACTIVE, ADC_MAX_ACTIVE);
+  currentMatrixSpeed = map(clamped, ADC_MIN_ACTIVE, ADC_MAX_ACTIVE, PAROLA_SPEED_SLOW, PAROLA_SPEED_FAST);
+  currentMatrixSpeed = constrain(currentMatrixSpeed, PAROLA_SPEED_FAST, PAROLA_SPEED_SLOW);
+  matrix.setSpeed(currentMatrixSpeed);
+}
+
+void onWsMessage(WebsocketsMessage message) {
+  String data = message.data();
+  if (data.length() == 0 || data == "ping") return;
+
+  int comma = data.indexOf(',');
+  if (comma <= 0) return;
+
+  latestRaw = data.substring(0, comma).toInt();
+  int filtered = data.substring(comma + 1).toInt();
+  updateMatrixSpeedFromFiltered(filtered);
+}
+
+void connectControllerWs() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (wsConnected) return;
+  if (millis() - lastWsAttempt < WS_RECONNECT_MS) return;
+
+  lastWsAttempt = millis();
+  Serial.printf("Connecting WS to ws://%s:%u%s\n", controllerHost, controllerPort, controllerPath);
+
+  wsClient.onMessage(onWsMessage);
+  wsClient.onEvent([](WebsocketsEvent event, String data) {
+    if (event == WebsocketsEvent::ConnectionOpened) {
+      wsConnected = true;
+      Serial.println("Controller WebSocket connected");
+    } else if (event == WebsocketsEvent::ConnectionClosed) {
+      wsConnected = false;
+      Serial.println("Controller WebSocket disconnected");
+    } else if (event == WebsocketsEvent::GotPing) {
+      wsConnected = true;
+    } else if (event == WebsocketsEvent::GotPong) {
+      wsConnected = true;
+    }
+  });
+
+  bool ok = wsClient.connect(controllerHost, controllerPort, controllerPath);
+  wsConnected = ok;
+  if (!ok) Serial.println("Controller WebSocket connect failed");
+}
+
+void setupMatrix() {
+  matrix.begin();
+  matrix.setIntensity(MATRIX_INTENSITY);
   matrix.displayClear();
-  matrix.displayText("TRAIN CAM", PA_CENTER, 75, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  matrix.setSpeed(PAROLA_SPEED_SLOW);
+  matrix.displayText((char*)SCROLL_TEXT, PA_LEFT, currentMatrixSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+}
 
+bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -58,27 +227,22 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG;  // for streaming
-  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  //                      for larger pre-allocated frame buffer.
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
       config.jpeg_quality = 10;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
     } else {
-      // Limit the frame size when PSRAM is not available
       config.frame_size = FRAMESIZE_SVGA;
       config.fb_location = CAMERA_FB_IN_DRAM;
     }
   } else {
-    // Best option for face detection/recognition
     config.frame_size = FRAMESIZE_240X240;
 #if CONFIG_IDF_TARGET_ESP32S3
     config.fb_count = 2;
@@ -90,39 +254,51 @@ void setup() {
   pinMode(14, INPUT_PULLUP);
 #endif
 
-  // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return false;
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  // initial sensors are flipped vertically and colors are a bit saturated
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);        // flip it back
-    s->set_brightness(s, 1);   // up the brightness just a bit
-    s->set_saturation(s, -2);  // lower the saturation
+  if (s && s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
   }
-  // drop down frame size for higher initial frame rate
-  if (config.pixel_format == PIXFORMAT_JPEG) {
+
+  if (config.pixel_format == PIXFORMAT_JPEG && s) {
     s->set_framesize(s, FRAMESIZE_QVGA);
   }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
+  if (s) {
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 1);
+  }
 #endif
 
 #if defined(CAMERA_MODEL_ESP32S3_EYE)
-  s->set_vflip(s, 1);
+  if (s) s->set_vflip(s, 1);
 #endif
 
-// Setup LED FLash if LED pin is defined in camera_pins.h
 #if defined(LED_GPIO_NUM)
   setupLedFlash();
 #endif
 
+  return true;
+}
+
+void setupWeb() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.begin();
+}
+
+void setupWifi() {
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
 
@@ -131,10 +307,30 @@ void setup() {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("");
+  Serial.println();
   Serial.println("WiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
 
-  startCameraServer();
+  if (MDNS.begin(HOSTNAME)) {
+    Serial.printf("mDNS started: http://%s.local/\n", HOSTNAME);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+
+  setupMatrix();
+
+  if (!initCamera()) {
+    return;
+  }
+
+  setupWifi();
+  setupWeb();
+  connectControllerWs();
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
@@ -142,8 +338,34 @@ void setup() {
 }
 
 void loop() {
-  if (matrix.displayAnimate()) {
-    matrix.displayReset();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wsConnected) connectControllerWs();
+    wsClient.poll();
   }
-  delay(5);
+
+  if (matrixStopped) {
+    if (HOLD_TEXT_WHEN_STOPPED) {
+      delay(5);
+    } else {
+      if (matrix.displayAnimate()) {
+        matrix.displayReset();
+      }
+      delay(5);
+    }
+  } else {
+    if (matrix.displayAnimate()) {
+      matrix.displayReset();
+    }
+    delay(5);
+  }
+
+  if (millis() - lastStatusLog >= STATUS_LOG_MS) {
+    lastStatusLog = millis();
+    Serial.printf("WS=%s raw=%d filtered=%d matrixSpeed=%d ip=%s\n",
+                  wsConnected ? "ON" : "OFF",
+                  latestRaw,
+                  latestFiltered,
+                  currentMatrixSpeed,
+                  WiFi.localIP().toString().c_str());
+  }
 }
