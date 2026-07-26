@@ -35,22 +35,32 @@ A debug web page is also served by the ESP32 at its local IP — visit it in any
 ```
 train-arduino/
 ├── esp32/
-│   ├── WIRING.md                       # Full wiring diagram, divider math, debug checklist
-│   └── train_pot_ws/
-│       └── train_pot_ws.ino            # ESP32 firmware: reads pot, averaging + EMA filter, WebSocket server
+│   ├── WIRING.md                           # Wiring reference (content consolidated below)
+│   ├── train_pot_ws/
+│   │   └── train_pot_ws.ino                # ESP32 firmware: reads pot, averaging + EMA filter, WebSocket server
+│   └── camera_web_server/
+│       └── CameraWebServer/                # ESP32-CAM web server sketch
 ├── unity/
-│   └── TrainSpeedReceiver.cs           # Unity script: WebSocket client → ILocomotive API
+│   ├── TrainSpeedReceiver.cs               # Unity script: WebSocket client → ILocomotive API (primary)
+│   ├── TrainPotReceiver.cs                 # Unity script: raw pot receiver variant
+│   └── gage-train-unity/                   # Unity project files
 ├── Train Controller (Railroad System) User Manual v3.4.pdf
 └── README.md
 ```
 
+---
+
 ## Wiring
 
-> ⚠️ The controller runs at **~19V** — the pot wiper **must not** connect directly to the ESP32. A voltage divider is required. See [`esp32/WIRING.md`](esp32/WIRING.md) for the full diagram.
+> ⚠️ The controller runs at **~19V** — the pot wiper **must not** connect directly to the ESP32. A voltage divider is required.
 
 ### Pot Identification
 
-The throttle pot has no markings. It measures ~10kΩ outer-to-outer on a multimeter (reads `010` on the 2000k range). The controller's reference voltage is ~19V.
+| Measurement | Value |
+|---|---|
+| Outer pin to outer pin | ~10kΩ (reads `010` on multimeter at 2000k range) |
+| Controller reference voltage | ~19V |
+| Pot type | Linear, unmarked |
 
 ### Voltage Divider (wiper → ESP32)
 
@@ -69,12 +79,23 @@ Controller GND ────────────┴── ESP32 GND
 
 **Divider math:** `19V × (10k ÷ (47k + 10k)) ≈ 3.33V` at full throttle — just within the ESP32's 3.3V ADC limit.
 
-### Hardware notes
+### Hardware Notes
 
-- **Shared ground is mandatory** — ESP32 GND and controller GND must be the same node
+- **Shared ground is mandatory** — ESP32 GND and controller GND must be the same node; if floating, readings will be wrong or zero
 - **Add a 0.1µF ceramic cap** from GPIO34 to GND (close to the ESP32 pin) to reduce noise
 - **Use ADC1 pins only** (GPIO32–39) while Wi-Fi is active — ADC2 is disabled by Wi-Fi
-- **Measure the divider output** with a multimeter before connecting the ESP32, confirm it stays under 3.3V at max throttle
+- **Measure before connecting** — confirm divider junction stays under 3.3V at max throttle with a multimeter
+
+### Debug Checklist
+
+- [ ] ESP32 GND tied to controller GND?
+- [ ] Divider junction (between R1 and R2) connected to GPIO34 — not the raw wiper?
+- [ ] Capacitor on GPIO34 to GND?
+- [ ] Using GPIO34–39 (ADC1), not GPIO0/2/4/12–15/25–27 (ADC2)?
+- [ ] `analogReadResolution` and `analogSetAttenuation` called in `setup()` only?
+- [ ] Divider output measured with meter before connecting ESP32 — confirmed under 3.3V?
+
+---
 
 ## ESP32 Setup
 
@@ -88,7 +109,16 @@ Controller GND ────────────┴── ESP32 GND
 6. Open Serial Monitor at **115200 baud** — the local IP will be printed on connect
 7. Visit that IP in a browser to confirm live pot readings
 
-### Message Format
+### ADC Configuration
+
+These must be set **once in `setup()`** — do not call them inside the read loop, as repeated calls add noise:
+
+```cpp
+analogReadResolution(12);       // 0–4095 range
+analogSetAttenuation(ADC_11db); // 0–3.3V input range
+```
+
+### WebSocket Message Format
 
 The ESP32 broadcasts a WebSocket message whenever the value changes meaningfully:
 
@@ -111,6 +141,8 @@ ESP32 ADC is inherently noisy, especially when Wi-Fi is active. Four layers of m
 | 16-sample averaging | Discards first read, averages 16 reads with 200µs gaps |
 | EMA filter α=0.03 | Slow exponential moving average smooths remaining jitter |
 | Deadband (±12 counts / 50ms) | Suppresses micro-fluctuations from triggering WebSocket sends |
+
+---
 
 ## Unity Setup
 
@@ -154,6 +186,15 @@ _loco.Brake        = (speed == 0) ? 1f : 0f;
 
 The asset's own acceleration physics, wagon coupling, SFX, Control Zones, and signals all continue to work normally — this script only feeds the throttle value in from the real-world pot.
 
+### Unity Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `TrainSpeedReceiver.cs` | Primary script — receives filtered ADC value, drives `ILocomotive` API with speed mapping |
+| `TrainPotReceiver.cs` | Variant — receives raw pot value; use for custom mapping or debugging |
+
+---
+
 ## Calibration
 
 | Symptom | Fix |
@@ -165,6 +206,8 @@ The asset's own acceleration physics, wagon coupling, SFX, Control Zones, and si
 | `ILocomotive` not found | Ensure locomotive GameObject has `TrainController_v3` or `SplineBasedLocomotive` component |
 | ESP32 reads zero or nothing | Check shared ground; confirm divider junction is under 3.3V; use GPIO32–39 only |
 | Readings still fluctuate wildly | Add 0.1µF cap on GPIO34 to GND; confirm `analogReadResolution` / `analogSetAttenuation` are in `setup()` only |
+
+---
 
 ## Dependencies
 
