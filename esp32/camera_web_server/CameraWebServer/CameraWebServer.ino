@@ -15,7 +15,7 @@ using namespace websockets;
 const char *ssid = "Wireless-N";
 const char *password = "";
 
-const char *controllerHost = "192.168.1.50";
+const char *controllerHost = "192.168.10.101";
 const uint16_t controllerPort = 80;
 const char *controllerPath = "/ws";
 
@@ -34,8 +34,8 @@ const uint8_t MATRIX_INTENSITY = 2;
 // Lower Parola speed number = faster movement.
 const int ADC_MIN_ACTIVE = 900;
 const int ADC_MAX_ACTIVE = 3200;
-const int PAROLA_SPEED_SLOW = 120;
-const int PAROLA_SPEED_FAST = 12;
+const int PAROLA_SPEED_SLOW = -120;
+const int PAROLA_SPEED_FAST = -12;
 const int STOP_THRESHOLD = 850;
 const bool HOLD_TEXT_WHEN_STOPPED = false;
 
@@ -338,25 +338,19 @@ void setup() {
 }
 
 void loop() {
+  server.handleClient();
+
   if (WiFi.status() == WL_CONNECTED) {
     if (!wsConnected) connectControllerWs();
     wsClient.poll();
   }
 
   if (matrixStopped) {
-    if (HOLD_TEXT_WHEN_STOPPED) {
-      delay(5);
-    } else {
-      if (matrix.displayAnimate()) {
-        matrix.displayReset();
-      }
-      delay(5);
+    if (!HOLD_TEXT_WHEN_STOPPED) {
+      if (matrix.displayAnimate()) matrix.displayReset();
     }
   } else {
-    if (matrix.displayAnimate()) {
-      matrix.displayReset();
-    }
-    delay(5);
+    if (matrix.displayAnimate()) matrix.displayReset();
   }
 
   if (millis() - lastStatusLog >= STATUS_LOG_MS) {
@@ -368,4 +362,6 @@ void loop() {
                   currentMatrixSpeed,
                   WiFi.localIP().toString().c_str());
   }
+
+  delay(5);
 }
