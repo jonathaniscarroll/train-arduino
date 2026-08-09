@@ -127,12 +127,24 @@ void streamTick() {
   if (now - lastFrameTime < FRAME_INTERVAL_MS) return;
   lastFrameTime = now;
 
+  // Non-blocking MJPEG: only send a frame if the client's TX buffer has
+  // room for the entire frame. If the browser is slow, drop the frame
+  // instead of blocking loop() (which would freeze the LED matrix).
+  size_t avail = streamClient.availableForWrite();
+  if (avail < 1024) return;  // not enough room — skip this frame
+
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return;
 
-  streamClient.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
-  streamClient.print(fb->len);
-  streamClient.print("\r\n\r\n");
+  String header = String("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ") +
+                  String(fb->len) + String("\r\n\r\n");
+  size_t needed = header.length() + fb->len + 2;  // +2 for trailing \r\n
+  if (avail < needed) {
+    esp_camera_fb_return(fb);
+    return;  // not enough room for the full frame — drop it
+  }
+
+  streamClient.print(header);
   streamClient.write(fb->buf, fb->len);
   streamClient.print("\r\n");
   esp_camera_fb_return(fb);
