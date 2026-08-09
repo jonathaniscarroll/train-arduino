@@ -6,7 +6,8 @@
 #include <MD_MAX72xx.h>
 #include <SPI.h>
 #include <ArduinoWebsockets.h>
-
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 using namespace websockets;
 
 // ===========================
@@ -15,9 +16,15 @@ using namespace websockets;
 const char *ssid = "Wireless-N";
 const char *password = "";
 
-const char *controllerHost = "192.168.10.101";
-const uint16_t controllerPort = 80;
-const char *controllerPath = "/ws";
+// const char *controllerHost = "192.168.10.101";
+// const uint16_t controllerPort = 80;
+// const char *controllerPath = "/ws";
+
+AsyncWebServer wsServer(81);  // separate port for WS server
+AsyncWebSocket ws("/ws");     // at ws://<camera_ip>:81/ws
+
+int latestRaw = 0;
+int latestFiltered = 0;
 
 // Non-blocking stream state
 bool streaming = false;
@@ -55,9 +62,9 @@ const uint32_t STATUS_LOG_MS = 2000;
 
 MD_Parola matrix = MD_Parola(HARDWARE_TYPE, MATRIX_DATA_PIN, MATRIX_CLK_PIN, MATRIX_CS_PIN, MAX_DEVICES);
 WebServer server(80);
-WebsocketsClient wsClient;
+// WebsocketsClient wsClient;
 
-bool wsConnected = false;
+// bool wsConnected = false;
 unsigned long lastWsAttempt = 0;
 unsigned long lastStatusLog = 0;
 int latestRaw = 0;
@@ -144,6 +151,27 @@ void streamTick() {
   streamClient.write(fb->buf, fb->len);
   streamClient.print("\r\n");
   esp_camera_fb_return(fb);
+}
+
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("[WS] Train controller connected from %s\n",
+                  client->remoteIP().toString().c_str());
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("[WS] Train controller disconnected\n");
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->opcode == WS_TEXT) {
+      String msg = String((char*)data, info->len);
+      int comma = msg.indexOf(',');
+      if (comma > 0) {
+        latestRaw = msg.substring(0, comma).toInt();
+        int filtered = msg.substring(comma + 1).toInt();
+        updateMatrixSpeedFromFiltered(filtered);
+      }
+    }
+  }
 }
 
 void updateMatrixSpeedFromFiltered(int filtered) {

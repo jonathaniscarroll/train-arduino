@@ -24,29 +24,36 @@
  *    are still completing their opening handshake.
  */
 
+
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 
+
 const char* ssid     = "Wireless-N";
 const char* password = "";
 
+
 // Static IP configuration — adjust to your network
 IPAddress local_IP(192, 168, 10, 101);   // the address you want
-IPAddress gateway(192, 168, 10, 1);      // your router’s IP
+IPAddress gateway(192, 168, 10, 1);      // your router's IP
 IPAddress subnet(255, 255, 255, 0);
 IPAddress dns(192, 168, 10, 1);          // or your ISP DNS
+
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
+
 const int potPin = 34;            // ADC1 — safe with Wi-Fi active
 
+
 // ── Timing constants ────────────────────────────────────────────────────────
-const unsigned long PING_INTERVAL_MS    = 5000;  // send WS ping every 5 s
-const unsigned long CLEANUP_INTERVAL_MS = 2000;  // cleanupClients every 2 s
-const unsigned long SEND_INTERVAL_MS    =   50;  // max send rate
-const unsigned long SAMPLE_INTERVAL_US  =  200;  // gap between ADC samples
+const unsigned long PING_INTERVAL_MS    = 15000;  // send WS ping every 15 s (was 5 s)
+const unsigned long CLEANUP_INTERVAL_MS = 5000;   // cleanupClients every 5 s (was 2 s)
+const unsigned long SEND_INTERVAL_MS    =   50;   // max send rate
+const unsigned long SAMPLE_INTERVAL_US  =  200;   // gap between ADC samples
+
 
 // ── State ────────────────────────────────────────────────────────────────────
 int lastSent = -1;
@@ -56,12 +63,14 @@ unsigned long lastCleanupTime = 0;
 float filtered = 0.0f;
 const float alpha = 0.03f;
 
+
 // ── ADC sampling ─────────────────────────────────────────────────────────────
 // Uses millis/micros-based non-blocking loop rather than delayMicroseconds()
 // so the async TCP stack is never starved.
 int readPotAveraged() {
   // Dummy read to discharge sample-and-hold capacitor
   analogRead(potPin);
+
 
   long total = 0;
   const int SAMPLES = 16;
@@ -72,6 +81,7 @@ int readPotAveraged() {
   }
   return (int)(total / SAMPLES);
 }
+
 
 // ── HTML debug page ──────────────────────────────────────────────────────────
 const char index_html[] PROGMEM = R"rawliteral(
@@ -122,6 +132,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+
 // ── WebSocket event handler ───────────────────────────────────────────────────
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                AwsEventType type, void *arg, uint8_t *data, size_t len) {
@@ -136,24 +147,31 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     Serial.printf("[WS] Client #%u disconnected\n", client->id());
   } else if (type == WS_EVT_ERROR) {
     Serial.printf("[WS] Client #%u error\n", client->id());
+  } else if (type == WS_EVT_PONG) {
+    Serial.printf("[WS] Client #%u pong\n", client->id());
   }
 }
+
 
 // ── Notify clients with pot value ─────────────────────────────────────────────
 void notifyClients() {
   if (ws.count() == 0) return;  // no clients — skip ADC read entirely
 
+
   int raw = readPotAveraged();
   filtered = filtered + alpha * (raw - filtered);
   int filt = (int)(filtered + 0.5f);
 
+
   // Deadband: skip send if change is tiny AND we sent recently
   if (abs(filt - lastSent) < 12 && millis() - lastSendTime < SEND_INTERVAL_MS) return;
+
 
   lastSent     = filt;
   lastSendTime = millis();
   ws.textAll(String(raw) + "," + String(filt));
 }
+
 
 // ── Keepalive ping ────────────────────────────────────────────────────────────
 // Prevents Unity NativeWebSocket from dropping the connection with
@@ -166,21 +184,26 @@ void sendPing() {
   ws.pingAll();  // sends a WebSocket ping frame to all connected clients
 }
 
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   pinMode(potPin, INPUT);
 
+
   // Configure ADC once in setup — not in the read loop
   analogReadResolution(12);        // 0–4095
   analogSetAttenuation(ADC_11db);  // 0–3.3V input range
 
+
   WiFi.mode(WIFI_STA);
+
 
   // Apply static IP configuration
   if (!WiFi.config(local_IP, gateway, subnet, dns)) {
     Serial.println("WiFi.config failed, continuing with DHCP");
   }
+
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
@@ -192,29 +215,35 @@ void setup() {
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 
+
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
+
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html);
   });
 
+
   server.begin();
   Serial.println("WebSocket server started — visit http://" + WiFi.localIP().toString());
 }
+
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
   notifyClients();
   sendPing();
 
+
   // Rate-limit cleanupClients — calling it every loop iteration can
   // kick clients that are still completing the opening handshake.
   unsigned long now = millis();
   if (now - lastCleanupTime >= CLEANUP_INTERVAL_MS) {
     lastCleanupTime = now;
-    ws.cleanupClients();
+    ws.cleanupClients(1);  // keep only 1 client, drop oldest
   }
+
 
   delay(10);
 }
