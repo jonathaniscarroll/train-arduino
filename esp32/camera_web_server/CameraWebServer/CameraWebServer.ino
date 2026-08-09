@@ -19,6 +19,12 @@ const char *controllerHost = "192.168.10.101";
 const uint16_t controllerPort = 80;
 const char *controllerPath = "/ws";
 
+// Non-blocking stream state
+bool streaming = false;
+WiFiClient streamClient;
+unsigned long lastFrameTime = 0;
+const unsigned long FRAME_INTERVAL_MS = 33;  // ~30 fps
+
 #define HOSTNAME "traincam"
 
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
@@ -32,11 +38,11 @@ const uint8_t MATRIX_INTENSITY = 2;
 
 // Map controller filtered ADC to Parola scroll speed.
 // Lower Parola speed number = faster movement.
-const int ADC_MIN_ACTIVE = 900;
-const int ADC_MAX_ACTIVE = 3200;
-const int PAROLA_SPEED_SLOW = -120;
-const int PAROLA_SPEED_FAST = -12;
-const int STOP_THRESHOLD = 850;
+const int ADC_MIN_ACTIVE = 0;
+const int ADC_MAX_ACTIVE = 3000;
+const int PAROLA_SPEED_SLOW = 240;
+const int PAROLA_SPEED_FAST = 3;
+const int STOP_THRESHOLD = 10;
 const bool HOLD_TEXT_WHEN_STOPPED = false;
 
 const uint32_t WS_RECONNECT_MS = 3000;
@@ -111,33 +117,33 @@ void handleSnapshot() {
 }
 
 void handleStream() {
-  WiFiClient client = server.client();
-  client.print("HTTP/1.1 200 OK\r\n");
-  client.print("Content-Type: multipart/x-mixed-replace; boundary=frame\r\n");
-  client.print("Cache-Control: no-cache\r\n\r\n");
+  streaming = true;
+  streamClient = server.client();
+  streamClient.print("HTTP/1.1 200 OK\r\n");
+  streamClient.print("Content-Type: multipart/x-mixed-replace; boundary=frame\r\n");
+  streamClient.print("Cache-Control: no-cache\r\n\r\n");
+  // Return immediately — actual streaming happens in loop()
+}
 
-  while (client.connected()) {
-    wsClient.poll();
-
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
-      delay(30);
-      continue;
-    }
-
-    client.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
-    client.print(fb->len);
-    client.print("\r\n\r\n");
-    client.write(fb->buf, fb->len);
-    client.print("\r\n");
-    esp_camera_fb_return(fb);
-
-    if (matrixStopped) {
-      delay(60);
-    } else {
-      delay(30);
-    }
+void streamTick() {
+  if (!streaming || !streamClient.connected()) {
+    streaming = false;
+    return;
   }
+
+  unsigned long now = millis();
+  if (now - lastFrameTime < FRAME_INTERVAL_MS) return;
+  lastFrameTime = now;
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  streamClient.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
+  streamClient.print(fb->len);
+  streamClient.print("\r\n\r\n");
+  streamClient.write(fb->buf, fb->len);
+  streamClient.print("\r\n");
+  esp_camera_fb_return(fb);
 }
 
 void updateMatrixSpeedFromFiltered(int filtered) {
@@ -152,10 +158,13 @@ void updateMatrixSpeedFromFiltered(int filtered) {
 
   matrixStopped = false;
   int clamped = constrain(filtered, ADC_MIN_ACTIVE, ADC_MAX_ACTIVE);
-  currentMatrixSpeed = map(clamped, ADC_MIN_ACTIVE, ADC_MAX_ACTIVE, PAROLA_SPEED_SLOW, PAROLA_SPEED_FAST);
-  currentMatrixSpeed = constrain(currentMatrixSpeed, PAROLA_SPEED_FAST, PAROLA_SPEED_SLOW);
+  currentMatrixSpeed = map(clamped, ADC_MIN_ACTIVE, ADC_MAX_ACTIVE, 
+                           PAROLA_SPEED_SLOW, PAROLA_SPEED_FAST);
+  currentMatrixSpeed = constrain(currentMatrixSpeed, 
+                                 PAROLA_SPEED_FAST, PAROLA_SPEED_SLOW);
   matrix.setSpeed(currentMatrixSpeed);
 }
+
 
 void onWsMessage(WebsocketsMessage message) {
   String data = message.data();
@@ -345,6 +354,10 @@ void loop() {
     wsClient.poll();
   }
 
+  // Non-blocking stream frames
+  streamTick();
+
+  // Parola animation
   if (matrixStopped) {
     if (!HOLD_TEXT_WHEN_STOPPED) {
       if (matrix.displayAnimate()) matrix.displayReset();

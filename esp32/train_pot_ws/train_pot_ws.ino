@@ -31,6 +31,12 @@
 const char* ssid     = "Wireless-N";
 const char* password = "";
 
+// Static IP configuration — adjust to your network
+IPAddress local_IP(192, 168, 10, 101);   // the address you want
+IPAddress gateway(192, 168, 10, 1);      // your router’s IP
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(192, 168, 10, 1);          // or your ISP DNS
+
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
@@ -170,6 +176,12 @@ void setup() {
   analogSetAttenuation(ADC_11db);  // 0–3.3V input range
 
   WiFi.mode(WIFI_STA);
+
+  // Apply static IP configuration
+  if (!WiFi.config(local_IP, gateway, subnet, dns)) {
+    Serial.println("WiFi.config failed, continuing with DHCP");
+  }
+
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
