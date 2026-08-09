@@ -5,10 +5,8 @@
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
 #include <SPI.h>
-#include <ArduinoWebsockets.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-using namespace websockets;
 
 // ===========================
 // Tunable settings
@@ -16,15 +14,8 @@ using namespace websockets;
 const char *ssid = "Wireless-N";
 const char *password = "";
 
-// const char *controllerHost = "192.168.10.101";
-// const uint16_t controllerPort = 80;
-// const char *controllerPath = "/ws";
-
 AsyncWebServer wsServer(81);  // separate port for WS server
 AsyncWebSocket ws("/ws");     // at ws://<camera_ip>:81/ws
-
-int latestRaw = 0;
-int latestFiltered = 0;
 
 // Non-blocking stream state
 bool streaming = false;
@@ -52,7 +43,6 @@ const int PAROLA_SPEED_FAST = 3;
 const int STOP_THRESHOLD = 10;
 const bool HOLD_TEXT_WHEN_STOPPED = false;
 
-const uint32_t WS_RECONNECT_MS = 3000;
 const uint32_t STATUS_LOG_MS = 2000;
 
 // ===========================
@@ -62,10 +52,7 @@ const uint32_t STATUS_LOG_MS = 2000;
 
 MD_Parola matrix = MD_Parola(HARDWARE_TYPE, MATRIX_DATA_PIN, MATRIX_CLK_PIN, MATRIX_CS_PIN, MAX_DEVICES);
 WebServer server(80);
-// WebsocketsClient wsClient;
 
-// bool wsConnected = false;
-unsigned long lastWsAttempt = 0;
 unsigned long lastStatusLog = 0;
 int latestRaw = 0;
 int latestFiltered = 0;
@@ -85,9 +72,7 @@ String htmlPage() {
           "code{background:#222;padding:2px 6px;border-radius:6px} .ok{color:#7ee787}.warn{color:#ffd866}</style></head><body>";
   html += "<div class='card'><h1>XIAO Train Camera</h1>";
   html += "<p>Camera stream: <code>/stream</code> &nbsp; Snapshot: <code>/snapshot</code> &nbsp; Status: <code>/status</code></p>";
-  html += "<p>Controller WS: ";
-  html += wsConnected ? "<span class='ok'>connected</span>" : "<span class='warn'>disconnected</span>";
-  html += " &nbsp; Raw: " + String(latestRaw) + " &nbsp; Filtered: " + String(latestFiltered) + " &nbsp; Matrix speed: " + String(currentMatrixSpeed) + "</p>";
+  html += "<p>WS clients: " + String(ws.count()) + " &nbsp; Raw: " + String(latestRaw) + " &nbsp; Filtered: " + String(latestFiltered) + " &nbsp; Matrix speed: " + String(currentMatrixSpeed) + "</p>";
   html += "<img src='/stream' alt='Train camera stream'>";
   html += "</div></body></html>";
   return html;
@@ -99,7 +84,7 @@ void handleRoot() {
 
 void handleStatus() {
   String json = "{";
-  json += "\"wsConnected\":" + String(wsConnected ? "true" : "false");
+  json += "\"wsClients\":" + String(ws.count());
   json += ",\"raw\":" + String(latestRaw);
   json += ",\"filtered\":" + String(latestFiltered);
   json += ",\"matrixSpeed\":" + String(currentMatrixSpeed);
@@ -194,44 +179,11 @@ void updateMatrixSpeedFromFiltered(int filtered) {
 }
 
 
-void onWsMessage(WebsocketsMessage message) {
-  String data = message.data();
-  if (data.length() == 0 || data == "ping") return;
-
-  int comma = data.indexOf(',');
-  if (comma <= 0) return;
-
-  latestRaw = data.substring(0, comma).toInt();
-  int filtered = data.substring(comma + 1).toInt();
-  updateMatrixSpeedFromFiltered(filtered);
-}
-
-void connectControllerWs() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (wsConnected) return;
-  if (millis() - lastWsAttempt < WS_RECONNECT_MS) return;
-
-  lastWsAttempt = millis();
-  Serial.printf("Connecting WS to ws://%s:%u%s\n", controllerHost, controllerPort, controllerPath);
-
-  wsClient.onMessage(onWsMessage);
-  wsClient.onEvent([](WebsocketsEvent event, String data) {
-    if (event == WebsocketsEvent::ConnectionOpened) {
-      wsConnected = true;
-      Serial.println("Controller WebSocket connected");
-    } else if (event == WebsocketsEvent::ConnectionClosed) {
-      wsConnected = false;
-      Serial.println("Controller WebSocket disconnected");
-    } else if (event == WebsocketsEvent::GotPing) {
-      wsConnected = true;
-    } else if (event == WebsocketsEvent::GotPong) {
-      wsConnected = true;
-    }
-  });
-
-  bool ok = wsClient.connect(controllerHost, controllerPort, controllerPath);
-  wsConnected = ok;
-  if (!ok) Serial.println("Controller WebSocket connect failed");
+void setupWsServer() {
+  ws.onEvent(onWsEvent);
+  wsServer.addHandler(&ws);
+  wsServer.begin();
+  Serial.println("WebSocket server started on port 81 at /ws");
 }
 
 void setupMatrix() {
@@ -367,7 +319,7 @@ void setup() {
 
   setupWifi();
   setupWeb();
-  connectControllerWs();
+  setupWsServer();
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
@@ -376,11 +328,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!wsConnected) connectControllerWs();
-    wsClient.poll();
-  }
+  ws.cleanupClients();
 
   // Non-blocking stream frames
   streamTick();
@@ -396,8 +344,8 @@ void loop() {
 
   if (millis() - lastStatusLog >= STATUS_LOG_MS) {
     lastStatusLog = millis();
-    Serial.printf("WS=%s raw=%d filtered=%d matrixSpeed=%d ip=%s\n",
-                  wsConnected ? "ON" : "OFF",
+    Serial.printf("WS server on 81 clients=%d raw=%d filtered=%d matrixSpeed=%d ip=%s\n",
+                  ws.count(),
                   latestRaw,
                   latestFiltered,
                   currentMatrixSpeed,

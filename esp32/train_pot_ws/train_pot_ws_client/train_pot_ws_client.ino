@@ -26,9 +26,9 @@ using namespace websockets;
 const char* ssid     = "Wireless-N";
 const char* password = "";
 
-// Camera WebSocket server (the camera's AsyncWebSocket at /ws)
-const char* CAMERA_HOST = "192.168.10.100";  // change to your camera IP
-const uint16_t CAMERA_PORT = 80;
+// Camera WebSocket server (the camera's AsyncWebSocket at /ws on port 81)
+const char* CAMERA_HOST = "192.168.10.100";  // camera IP
+const uint16_t CAMERA_PORT = 81;
 const char* CAMERA_PATH = "/ws";
 
 const int potPin = 34;  // ADC1 — safe with Wi-Fi active
