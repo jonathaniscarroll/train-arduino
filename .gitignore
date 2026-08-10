@@ -105,4 +105,11 @@ unity/gage-train-unity/Library/*
 unity/gage-train-unity/[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
 
 # Auto-generated cache in Assets folder
-/[Aa]ssets/[Ss]ceneDependencyCache*
+unity/gage-train-unity/[Aa]ssets/[Ss]ceneDependencyCache*
+
+unity/gage-train-unity/[Aa]ssets/WSM Game Studio/*
+unity/gage-train-unity/[Aa]ssets/PyroParticles/*
+unity/gage-train-unity/[Aa]ssets/UnityTechnologies/*
+unity/gage-train-unity/[Aa]ssets/Materials/*
+unity/gage-train-unity/[Aa]ssets/PNGs/*
+unity/gage-train-unity/[Aa]ssets/*.obj
